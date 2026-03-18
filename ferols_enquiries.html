@@ -77,7 +77,7 @@ input,select,textarea{font-family:Georgia,serif;outline:none}
 .loading{display:flex;align-items:center;justify-content:center;padding:60px;color:rgba(255,255,255,0.35)}
 .back-to-hub{position:fixed;bottom:20px;right:20px;background:#0d4a1a;border:2px solid #f5c500;border-radius:30px;padding:10px 18px;color:#f5c500;font-size:13px;font-weight:bold;cursor:pointer;z-index:999;font-family:Georgia,serif;box-shadow:0 4px 16px rgba(0,0,0,0.4);text-decoration:none;display:flex;align-items:center;gap:8px}
 .back-to-hub:hover{background:#1a6b2a}
-@media(max-width:640px){.g2,.g3{grid-template-columns:1fr}.info-lbl{width:110px}.pipe-col{min-width:70px;font-size:11px}}
+@media(max-width:640px){.g2,.g3{grid-template-columns:1fr}.info-lbl{width:110px}.pipe-col{min-width:70px;font-size:11px}.child-grid{grid-template-columns:1fr 1fr !important}}
 @media print{.back-to-hub,.nav,.no-print{display:none}}
 </style>
 </head>
@@ -159,6 +159,8 @@ const blank=()=>({
   temperature:"Warm",status:"New",
   assignedTo:"",followUpDate:"",
   notes:"",
+  childrenTotal:0,infants:0,childrenAged:0,youngAdults:0,
+  childAges:"",childrenSharing:"",
 });
 
 // ── TOAST ─────────────────────────────────────────────────────────────────
@@ -329,6 +331,14 @@ function App(){
                   q.Destination&&e("span",null,"📍 "+q.Destination),
                   q.TravelDates&&e("span",null,"📅 "+q.TravelDates),
                   q.PAX&&e("span",null,"👥 "+q.PAX+" PAX"),
+                  q.ChildrenTotal&&Number(q.ChildrenTotal)>0&&e("span",{style:{color:"#f5c500"}},
+                    "👶 "+q.ChildrenTotal+" child"+(Number(q.ChildrenTotal)>1?"ren":"")
+                    +(q.ChildAges||q.Infants||q.ChildrenAged||q.YoungAdults?" ("+[
+                      q.Infants&&Number(q.Infants)>0?q.Infants+" inf":"",
+                      q.ChildrenAged&&Number(q.ChildrenAged)>0?q.ChildrenAged+" ch":"",
+                      q.YoungAdults&&Number(q.YoungAdults)>0?q.YoungAdults+" ya":""
+                    ].filter(Boolean).join(", ")+")":"")
+                  ),
                   q.Source&&e("span",null,"📲 "+q.Source)
                 ),
                 e("div",{style:{fontSize:11,color:"rgba(255,255,255,0.3)"}},
@@ -417,6 +427,58 @@ function App(){
               e("label",{className:"fl-label"},"Travel Style"),
               e("select",{className:"sel",value:form.travelStyle,onChange:ev=>upd("travelStyle",ev.target.value)},
                 ["","Luxury","Mid-range","Budget","Adventure","Family","Honeymoon","Corporate","Group"].map(v=>e("option",{key:v,value:v},v||"— Select —"))
+              )
+            )
+          )
+        ),
+        Number(form.pax)>1&&e("div",{className:"card"},
+          e("div",{className:"sh"},"👶 Child Policy"),
+          e("div",{style:{fontSize:12,color:"rgba(255,255,255,0.4)",marginBottom:16,lineHeight:1.8,background:"rgba(245,197,0,0.05)",border:"1px solid rgba(245,197,0,0.12)",borderRadius:8,padding:"10px 14px"}},
+            "⚠️ Different lodges & camps apply different rates and sharing rules based on age. Complete this section carefully — it affects pricing and room configuration."
+          ),
+          e("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:"0 16px",marginBottom:4}},
+            e("div",{className:"mb"},
+              e("label",{className:"fl-label"},"Total Children (under 18)"),
+              e("input",{className:"inp",type:"number",min:0,value:form.childrenTotal,
+                onChange:ev=>upd("childrenTotal",ev.target.value)})
+            ),
+            e("div",{className:"mb"},
+              e("label",{className:"fl-label"},"Infants (0–3 yrs)"),
+              e("input",{className:"inp",type:"number",min:0,value:form.infants,
+                onChange:ev=>upd("infants",ev.target.value)})
+            ),
+            e("div",{className:"mb"},
+              e("label",{className:"fl-label"},"Children (3–11 yrs)"),
+              e("input",{className:"inp",type:"number",min:0,value:form.childrenAged,
+                onChange:ev=>upd("childrenAged",ev.target.value)})
+            ),
+            e("div",{className:"mb"},
+              e("label",{className:"fl-label"},"Young Adults (12–17 yrs)"),
+              e("input",{className:"inp",type:"number",min:0,value:form.youngAdults,
+                onChange:ev=>upd("youngAdults",ev.target.value)})
+            )
+          ),
+          e("div",{style:{background:"rgba(34,197,94,0.07)",border:"1px solid rgba(34,197,94,0.15)",borderRadius:8,padding:"10px 14px",marginBottom:14,fontSize:12,color:"rgba(255,255,255,0.55)",display:"flex",gap:24,flexWrap:"wrap"}},
+            e("span",null,"🧑 Adults: ",e("b",{style:{color:"#4ade80"}},Math.max(0,Number(form.pax)-Number(form.childrenTotal||0)))),
+            e("span",null,"👶 Total children: ",e("b",{style:{color:"#f5c500"}},Number(form.childrenTotal||0))),
+            Number(form.infants)>0&&e("span",null,"🍼 Infants (0–3): ",e("b",{style:{color:"#f5c500"}},form.infants)),
+            Number(form.childrenAged)>0&&e("span",null,"🧒 Children (3–11): ",e("b",{style:{color:"#f5c500"}},form.childrenAged)),
+            Number(form.youngAdults)>0&&e("span",null,"🧑‍🦱 Young Adults (12–17): ",e("b",{style:{color:"#f5c500"}},form.youngAdults))
+          ),
+          e("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"0 16px"}},
+            e("div",{className:"mb"},
+              e("label",{className:"fl-label"},"Individual Ages (comma-separated)"),
+              e("input",{className:"inp",value:form.childAges,
+                placeholder:"e.g. 1, 4, 9, 14",
+                onChange:ev=>upd("childAges",ev.target.value)})
+            ),
+            e("div",{className:"mb"},
+              e("label",{className:"fl-label"},"Sharing Arrangement"),
+              e("select",{className:"sel",value:form.childrenSharing,
+                onChange:ev=>upd("childrenSharing",ev.target.value)},
+                ["","Sharing with parents / adults","Children in own room / tent",
+                 "Mix — some sharing, some own room","Infants in cot (not occupying bed)",
+                 "To be confirmed"].map(v=>e("option",{key:v,value:v},v||"— Select —"))
               )
             )
           )
@@ -556,6 +618,48 @@ function EnquiryDetail({enq,onBack,onUpdateStatus,onUpdateFollowUp,onConvert,sho
             e("input",{className:"inp",type:"date",value:newFollowUp,onChange:ev=>setNewFollowUp(ev.target.value)})
           ),
           e("button",{className:"btn btn-gold",style:{width:"100%"},onClick:()=>onUpdateFollowUp(enq,newFollowUp)},"💾 Set Follow-up Date")
+        )
+      ),
+      // Child Policy (shown when children data is present)
+      (Number(enq.ChildrenTotal||enq["Children Total"]||0)>0||enq.ChildAges||enq["Child Ages"])&&e("div",{className:"card",style:{marginBottom:14}},
+        e("div",{className:"sh"},"👶 Child Policy"),
+        e("div",{style:{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginBottom:14}},
+          e("div",{style:{background:"rgba(245,197,0,0.07)",border:"1px solid rgba(245,197,0,0.2)",borderRadius:8,padding:"10px 14px",textAlign:"center"}},
+            e("div",{style:{fontSize:20,fontWeight:"bold",color:"#f5c500"}},enq.ChildrenTotal||enq["Children Total"]||0),
+            e("div",{style:{fontSize:10,color:"rgba(255,255,255,0.4)",textTransform:"uppercase",letterSpacing:1,marginTop:2}},"Total Children")
+          ),
+          e("div",{style:{background:"rgba(59,130,246,0.07)",border:"1px solid rgba(59,130,246,0.2)",borderRadius:8,padding:"10px 14px",textAlign:"center"}},
+            e("div",{style:{fontSize:20,fontWeight:"bold",color:"#60a5fa"}},enq.Infants||0),
+            e("div",{style:{fontSize:10,color:"rgba(255,255,255,0.4)",textTransform:"uppercase",letterSpacing:1,marginTop:2}},"Infants 0–3 yrs")
+          ),
+          e("div",{style:{background:"rgba(34,197,94,0.07)",border:"1px solid rgba(34,197,94,0.2)",borderRadius:8,padding:"10px 14px",textAlign:"center"}},
+            e("div",{style:{fontSize:20,fontWeight:"bold",color:"#4ade80"}},enq.ChildrenAged||enq["Children Aged"]||0),
+            e("div",{style:{fontSize:10,color:"rgba(255,255,255,0.4)",textTransform:"uppercase",letterSpacing:1,marginTop:2}},"Children 3–11 yrs")
+          ),
+          e("div",{style:{background:"rgba(168,85,247,0.07)",border:"1px solid rgba(168,85,247,0.2)",borderRadius:8,padding:"10px 14px",textAlign:"center"}},
+            e("div",{style:{fontSize:20,fontWeight:"bold",color:"#c084fc"}},enq.YoungAdults||enq["Young Adults"]||0),
+            e("div",{style:{fontSize:10,color:"rgba(255,255,255,0.4)",textTransform:"uppercase",letterSpacing:1,marginTop:2}},"Young Adults 12–17")
+          )
+        ),
+        e("div",{style:{display:"flex",gap:20,flexWrap:"wrap",marginBottom:10}},
+          (enq.ChildAges||enq["Child Ages"])&&e("div",null,
+            e("div",{style:{fontSize:11,color:"rgba(255,255,255,0.4)",textTransform:"uppercase",letterSpacing:1,marginBottom:4}},"Individual Ages"),
+            e("div",{style:{fontSize:13,color:"rgba(255,255,255,0.85)",background:"rgba(255,255,255,0.05)",borderRadius:6,padding:"6px 12px"}},
+              enq.ChildAges||enq["Child Ages"]
+            )
+          ),
+          (enq.ChildrenSharing||enq["Children Sharing"])&&e("div",null,
+            e("div",{style:{fontSize:11,color:"rgba(255,255,255,0.4)",textTransform:"uppercase",letterSpacing:1,marginBottom:4}},"Sharing Arrangement"),
+            e("div",{style:{fontSize:13,color:"rgba(255,255,255,0.85)",background:"rgba(255,255,255,0.05)",borderRadius:6,padding:"6px 12px"}},
+              enq.ChildrenSharing||enq["Children Sharing"]
+            )
+          ),
+          e("div",null,
+            e("div",{style:{fontSize:11,color:"rgba(255,255,255,0.4)",textTransform:"uppercase",letterSpacing:1,marginBottom:4}},"Adults"),
+            e("div",{style:{fontSize:13,color:"#4ade80",fontWeight:"bold",background:"rgba(34,197,94,0.07)",borderRadius:6,padding:"6px 12px"}},
+              Math.max(0,Number(enq.PAX||0)-Number(enq.ChildrenTotal||enq["Children Total"]||0))+" adult"+(Math.max(0,Number(enq.PAX||0)-Number(enq.ChildrenTotal||enq["Children Total"]||0))!==1?"s":"")
+            )
+          )
         )
       ),
       // Notes
