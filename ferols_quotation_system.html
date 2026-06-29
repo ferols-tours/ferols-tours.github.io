@@ -234,37 +234,66 @@ function calcAccomDiscount(a, pax){
   return Math.min(totalDiscount,grossCPP); // never discount more than the cost
 }
 
-// ── CHILD PRICING HELPERS ──────────────────────────────────────────────────
-// Returns the "effective adult-equivalent PAX" count for accom/transport pricing
-// Infants: 0% of adult | Children: childRatePct% | YoungAdults: youngAdultRatePct%
-function childAdjustedPax(form){
-  const adults=Math.max(0,Number(form.pax)-Number(form.childrenTotal||0));
-  const inf=Number(form.infants||0);
-  const chld=Number(form.childrenAged||0);
-  const yng=Number(form.youngAdults||0);
-  const infantPct=Number(form.infantRatePct||0)/100;
-  const childPct=Number(form.childRatePct||50)/100;
-  const youngPct=Number(form.youngAdultRatePct||100)/100;
-  return adults+(inf*infantPct)+(chld*childPct)+(yng*youngPct);
+// ── MEAL CARD COST (when costBasis === "included") ─────────────────────────
+// Converts an accommodation's "included" meal-card agent costs into a CPP
+// (cost-per-person, for the whole stay at this stop) contribution, based on
+// each card's scope. Cards marked "operator" (true comp) or "client_pays"
+// (settled directly by guest) contribute nothing to Ferols' pricing.
+function mealCardCPP(a,pax){
+  const cards=a.mealCards||[];
+  const nights=Number(a.nights)||0;
+  const p=Number(pax)||0;
+  return cards.filter(c=>c.enabled&&c.costBasis==="included").reduce((s,c)=>{
+    const cost=Number(c.agentCost)||0;
+    switch(c.scope){
+      case"per_person_per_night":return s+cost*nights;
+      case"per_person_per_stay": return s+cost;
+      case"per_night":           return s+(p>0?(cost*nights)/p:0);
+      case"per_stay":            return s+(p>0?cost/p:0);
+      default:                   return s+cost; // fallback: treat as per-person-per-stay
+    }
+  },0);
 }
 
-// Returns child adjustment for park fees (may differ from accom)
-function childAdjustedParkPax(form){
-  const adults=Math.max(0,Number(form.pax)-Number(form.childrenTotal||0));
-  const inf=Number(form.infants||0);
-  const chld=Number(form.childrenAged||0);
-  const yng=Number(form.youngAdults||0);
-  const infantPct=Number(form.childParkFeeInfantPct||0)/100;
-  const childPct=Number(form.childParkFeeChildPct||50)/100;
-  const youngPct=Number(form.childParkFeeYoungAdultPct||100)/100;
-  return adults+(inf*infantPct)+(chld*childPct)+(yng*youngPct);
+
+// ── CONFERENCE / MEETING FACILITY COST ──────────────────────────────────────
+// Returns the CPP (cost-per-trip-pax) contribution of one conference facility
+// booking. Delegates default to the trip's total PAX but can be set lower
+// (e.g. only some guests attend a corporate session).
+function conferenceFacilityCPP(c,totalPax){
+  const tp=Number(totalPax)||0;
+  if(tp<=0)return 0;
+  const delegates=Number(c.numDelegates)||tp;
+  const days=Number(c.numDays)||1;
+  let total=0;
+  if(c.pricingBasis==="flat_day_rate"){
+    total=(Number(c.flatDayRate)||0)*days;
+  }else{
+    total=(Number(c.ratePerDelegate)||0)*delegates*days;
+  }
+  return total/tp;
 }
+
 
 // ── DRIVER/GUIDE COST HELPERS ─────────────────────────────────────────────
 // Returns total driver+guide cost per person (only when costBasis="client")
 // ── VEHICLE COST PER PERSON ─────────────────────────────────────────────
 // For per_vehicle pricing: total vehicle cost ÷ PAX
 // Includes driver/guide costs that are marked as client-facing
+// Resolves the per-person fare for scheduled services (SGR/Bus/Flight).
+// One-way and return are entered as SEPARATE rates since return fares are
+// almost never simply double the one-way price.
+// Returns {adult, infant, child, youngAdult} fare per person by category.
+function scheduledFareCPP(t, category){
+  const base=t.tripType==="return"?(Number(t.returnFare)||0):(Number(t.oneWayFare)||0);
+  if(!SCHEDULED_FARE_TYPES.includes(t.transportType)) return Number(t.costPerPerson)||0;
+  if(!category||category==="adult") return base;
+  if(category==="infant") return Number(t.infantFare)||0;  // default FREE
+  if(category==="child")  return t.childFare!=null&&t.childFare!==""?Number(t.childFare):base; // blank = adult rate
+  if(category==="youngAdult") return t.youngAdultFare!=null&&t.youngAdultFare!==""?Number(t.youngAdultFare):base;
+  return base;
+}
+
 function vehicleCostCPP(t, totalPax){
   if(!totalPax||totalPax<1)return 0;
   let vehicleTotal=0;
@@ -276,8 +305,8 @@ function vehicleCostCPP(t, totalPax){
     const num=Number(t.numVehicles)||1;
     vehicleTotal=rate*days*num;
   } else if(t.pricingBasis==="per_person"){
-    // Explicit per-person rate (e.g. SGR, shared shuttle)
-    return Number(t.costPerPerson)||0;
+    // Explicit per-person rate — scheduled fare (SGR/Bus/Flight class+direction) or flat shuttle rate
+    return scheduledFareCPP(t);
   } else if(t.pricingBasis==="per_trip"){
     vehicleTotal=Number(t.vehicleCostPerDay)||0; // single trip cost
   } else {
@@ -302,53 +331,102 @@ function driverGuideCPP(t, totalPax){ return 0; } // absorbed into vehicleCostCP
 function calcTotals(form,settings){
   const pax=Number(form.pax)||0;
   const margin=Number(form.serviceMarginPercent)||0;
-  const adjPax=childAdjustedPax(form);
-  const parkAdjPax=childAdjustedParkPax(form);
 
-  // Accommodation — use adult-equivalent PAX ratio for child discount
-  // We keep per-person rates as-is but note child adjustment in group total
-  const accomCPP=form.accommodations.reduce((s,a)=>s+effectiveCPPN(a)*(Number(a.nights)||0),0);
+  // ── Accommodation (raw, before discounts) — includes any "included" meal-card costs ──
+  const accomCPP=form.accommodations.reduce((s,a)=>
+    s+effectiveCPPN(a)*(Number(a.nights)||0)+mealCardCPP(a,pax),0);
   const discountCPP=form.accommodations.reduce((s,a)=>s+calcAccomDiscount(a,pax),0);
+  const accomNetCPP=accomCPP-discountCPP; // net per-adult accommodation cost (incl. meal cards)
 
-  // Child accom adjustment: difference between full-PAX and adjusted-PAX total, spread per person
-  // e.g. if children get 50% off, the group total is less — we express as a per-person saving
-  const accomGroupFull=accomCPP*pax;
-  const accomGroupAdj=(accomCPP-discountCPP)*adjPax; // adjusted for children
-  const childAccomSavingCPP=pax>0?(accomGroupFull-discountCPP*pax-accomGroupAdj)/pax:0;
-
-  const transportCPP=form.transports.reduce((s,t)=>s+vehicleCostCPP(t,pax),0);
-  const excursionCPP=form.excursions.reduce((s,x)=>s+(Number(x.costPerPerson)||0),0);
-
-  // Park fees — group-aware: adults at full rate, children at concession rate, infants free
-  const adults=Math.max(0,pax-Number(form.childrenTotal||0));
+  // ── Group composition ──
+  const adults=Math.max(0,pax-(Number(form.infants||0)+Number(form.childrenAged||0)+Number(form.youngAdults||0)));
   const infants=Number(form.infants||0);
   const children=Number(form.childrenAged||0);
   const youngAdults=Number(form.youngAdults||0);
-  const parkGroupTotal=form.parkFees.filter(p=>p.includedInPackage&&p.costPerPerson).reduce((s,p)=>{
+
+  // ── Transport: split into road (per-vehicle) vs scheduled (per-person, category-aware) ──
+  // Road/private transfers: infants are FREE (lap or arm), cost split across paying pax only
+  // Scheduled (SGR/Bus/Flight): each category has its own entered fare
+  const transportRate={adult:0,infant:0,child:0,youngAdult:0};
+  form.transports.forEach(t=>{
+    if(SCHEDULED_FARE_TYPES.includes(t.transportType)){
+      // Scheduled: use entered category fares
+      transportRate.adult    += scheduledFareCPP(t,"adult");
+      transportRate.infant   += scheduledFareCPP(t,"infant");   // default 0 (FREE)
+      transportRate.child    += scheduledFareCPP(t,"child");
+      transportRate.youngAdult+=scheduledFareCPP(t,"youngAdult");
+    } else {
+      // Private road transfer / safari vehicle: flat per-person cost; infants FREE (lap/arm)
+      // Divide vehicle total across pax who actually occupy a seat (adults + children + youngAdults; infants free)
+      const payingPax=Math.max(1,adults+children+youngAdults);
+      const cpp=vehicleCostCPP(t,payingPax);
+      transportRate.adult    += cpp;
+      transportRate.infant   += 0;   // Infants always free on road transfers
+      transportRate.child    += cpp; // children occupy a seat → pay same as adult
+      transportRate.youngAdult+=cpp;
+    }
+  });
+  const transportCPP=transportRate.adult; // adult reference rate for display
+
+  const excursionCPP=form.excursions.reduce((s,x)=>s+(Number(x.costPerPerson)||0),0);
+  const conferenceCPP=(form.conferenceFacilities||[]).reduce((s,c)=>s+conferenceFacilityCPP(c,pax),0);
+
+  // ── Accommodation rate % by category ──
+  const accomPct={
+    adult:1,
+    infant:Number(form.infantRatePct||0)/100,
+    child:Number(form.childRatePct||50)/100,
+    youngAdult:Number(form.youngAdultRatePct||100)/100,
+  };
+
+  // ── Park fees — per-category rate per person, summed across all included park fees ──
+  const parkPct={
+    infant:Number(form.childParkFeeInfantPct||0)/100,
+    youngAdult:Number(form.childParkFeeYoungAdultPct||100)/100,
+  };
+  const parkRate={adult:0,infant:0,child:0,youngAdult:0};
+  form.parkFees.filter(p=>p.includedInPackage&&p.costPerPerson).forEach(p=>{
     const adultRate=Number(p.costPerPerson)||0;
     const childRate=Number(p.childCostPerPerson)||adultRate*Number(form.childParkFeeChildPct||50)/100;
     const youngAdultRate=Number(p.youngAdultCostPerPerson)||adultRate;
-    return s + adults*adultRate + infants*0 + children*childRate + youngAdults*youngAdultRate;
-  },0);
-  const parkIncCPP=pax>0?parkGroupTotal/pax:0;
+    parkRate.adult+=adultRate;
+    parkRate.infant+=adultRate*parkPct.infant;
+    parkRate.child+=childRate;
+    parkRate.youngAdult+=youngAdultRate;
+  });
 
-  const sub=(accomCPP-discountCPP)+transportCPP+excursionCPP+parkIncCPP;
-  const svc=sub*(margin/100);
-  const total=sub+svc;
+  // ── Per-category subtotal (before margin) and total (after margin) ──
+  // Each category: accom (% of adult) + transport (category-specific) + excursion (same) + conference (same) + park
+  const catSub=cat=>accomNetCPP*accomPct[cat]+transportRate[cat]+excursionCPP+conferenceCPP+parkRate[cat];
+  const catTotal=cat=>{const s=catSub(cat);return s+s*(margin/100);};
+
+  const totalAdult     =catTotal("adult");
+  const totalInfant    =catTotal("infant");
+  const totalChild     =catTotal("child");
+  const totalYoungAdult=catTotal("youngAdult");
+
+  const totalGroup=adults*totalAdult+infants*totalInfant+children*totalChild+youngAdults*totalYoungAdult;
+
+  // ── Backward-compatible aggregate fields ──
+  const parkIncCPP=pax>0
+    ?(parkRate.adult*adults+parkRate.infant*infants+parkRate.child*children+parkRate.youngAdult*youngAdults)/pax
+    :0;
+  const sub=accomNetCPP+transportCPP+excursionCPP+conferenceCPP+parkIncCPP;
+  const serviceFeeCPP=sub*(margin/100);
+  const totalCPP=totalAdult; // "Per Adult" headline figure
   const nights=form.accommodations.reduce((s,a)=>s+(Number(a.nights)||0),0);
+  const adjPax=totalAdult>0?totalGroup/totalAdult:pax;
 
-  // Group total uses adjusted pax for accom/parks, full pax for transport/excursions
-  const groupTransport=(transportCPP)*pax;
-  const groupExcursion=excursionCPP*pax;
-  const groupAccom=(accomCPP-discountCPP)*adjPax;
-  const groupPark=parkGroupTotal; // already the full group total
-  const groupSub=groupAccom+groupTransport+groupExcursion+groupPark;
-  const groupSvc=groupSub*(margin/100);
-  const totalGroup=groupSub+groupSvc;
-
-  return{accomCPP,discountCPP,transportCPP,excursionCPP,parkIncCPP,serviceFeeCPP:svc,
-    totalCPP:total,totalGroup,pax,totalNightsBooked:nights,
-    adjPax,parkAdjPax,hasChildren:Number(form.childrenTotal||0)>0};
+  return{accomCPP,discountCPP,transportCPP,excursionCPP,conferenceCPP,parkIncCPP,parkRateByCategory:parkRate,serviceFeeCPP,
+    totalCPP,totalGroup,pax,totalNightsBooked:nights,
+    adjPax,hasChildren:(Number(form.infants||0)+Number(form.childrenAged||0)+Number(form.youngAdults||0))>0,
+    transportRateByCategory:transportRate,
+    categories:{
+      adult:     {count:adults,     rate:totalAdult,     subtotal:adults*totalAdult},
+      infant:    {count:infants,    rate:totalInfant,    subtotal:infants*totalInfant},
+      child:     {count:children,   rate:totalChild,     subtotal:children*totalChild},
+      youngAdult:{count:youngAdults,rate:totalYoungAdult,subtotal:youngAdults*totalYoungAdult},
+    }};
 }
 
 let _id=100;
@@ -381,8 +459,34 @@ const newParkFee=(clientType)=>({id:uid(),parkName:"",destination:"",season:"Hig
   nationality:clientType||"Non-Resident",
   includedInPackage:true,notes:""});
 
+// ── CONFERENCE / MEETING FACILITY ───────────────────────────────────────────
+const CONFERENCE_PACKAGE_TYPES=["Full Day Conference (8hrs)","Half Day Conference (4hrs)","Room Hire Only (No Catering)","Residential Package (Conference + Accommodation)"];
+const newConferenceFacility=(pax)=>({
+  id:uid(),facilityName:"",venue:"",date:"",
+  packageType:"Full Day Conference (8hrs)",
+  pricingBasis:"per_delegate", // "per_delegate" | "flat_day_rate"
+  ratePerDelegate:"",
+  flatDayRate:"",
+  numDelegates:pax||"",        // defaults to trip PAX, editable (not everyone may attend)
+  numDays:1,
+  inclusions:{
+    teaBreaks:true,lunch:true,projector:true,screen:true,
+    flipchart:true,wifi:true,paSystem:false,stationery:true,bottledWater:true
+  },
+  notes:""
+});
+
 const MEAL_PLANS={RO:"Room Only (no meals)",BB:"Bed & Breakfast",HB:"Half Board (breakfast + dinner)",FB:"Full Board (all meals)",AI:"All Inclusive"};
-const TRANSPORT_TYPES=["SGR (Standard Gauge Railway)","Private Road Transfer","Safari Game Drive","Air Charter / Scheduled Flight","Transfer / Airport Pickup","Overland Truck / Camping","Boat / Ferry","N/A"];
+const TRANSPORT_TYPES=["SGR (Standard Gauge Railway)","Bus / Coach (Scheduled)","Private Road Transfer","Safari Game Drive","Air Charter / Scheduled Flight","Transfer / Airport Pickup","Overland Truck / Camping","Boat / Ferry","N/A"];
+
+// Service classes for scheduled-fare transport (SGR / Bus / Scheduled Flight).
+// Each mode has its own typical class names; fares are entered per class, per direction.
+const SCHEDULED_FARE_TYPES=["SGR (Standard Gauge Railway)","Bus / Coach (Scheduled)","Air Charter / Scheduled Flight"];
+const SERVICE_CLASSES={
+  "SGR (Standard Gauge Railway)":["Economy","Premium","VIP / First Class"],
+  "Bus / Coach (Scheduled)":["Economy","Business / VIP","Executive"],
+  "Air Charter / Scheduled Flight":["Economy","Business","First Class"],
+};
 
 // Vehicle fleet — each entry: label, capacity (max pax), daily rate hint (KES), notes
 const VEHICLE_FLEET=[
@@ -423,6 +527,12 @@ const newTransport=()=>({
   autoVehicle:true,           // if true, auto-suggest vehicle based on PAX
   // Legacy per-person field kept for backwards compat / overland trucks
   costPerPerson:"",
+  // Scheduled-fare fields (SGR / Bus / Scheduled Flight) — one-way and return
+  // are entered SEPARATELY since return fares are rarely just 2× one-way.
+  serviceClass:"Economy",     // e.g. SGR Economy/Premium/VIP, Bus Economy/VIP
+  tripType:"one_way",         // "one_way" | "return"
+  oneWayFare:"",              // KES per person, one direction
+  returnFare:"",              // KES per person, round trip (NOT auto-doubled)
   fromLocation:"",toLocation:"",
   driverIncluded:true,guideIncluded:false,
   driverDailyRate:"",guideDailyRate:"",driverDays:1,guideDays:1,
@@ -437,8 +547,8 @@ const defaultSettings={
   sheetId:DEFAULT_SHEET_ID,
   scriptUrl:SCRIPT_URL,
   companyName:"Ferols Tours & Safaris",
-  companyEmail:"toursandsafarisferols@gmail.com",
-  companyPhone:"+254 732 978 537",
+  companyEmail:"info@ferolstours.com",
+  companyPhone:"+254 720 265805 | +254 732 978537",
   companyAddress:"Norfolk Towers, Kijabe St, Nairobi",
   defaultMarkup:20,
   defaultMargin:10,
@@ -465,7 +575,7 @@ const defaultForm={
   groupName:"",pax:2,checkIn:"",checkOut:"",totalNights:3,destination:"",
   clientType:"Non-Resident",
   // Child policy
-  childrenTotal:0,infants:0,childrenAged:0,youngAdults:0,childAges:"",childrenSharing:"",
+  infants:0,lapInfants:0,childrenAged:0,youngAdults:0,childAges:"",childrenSharing:"",
   // Child rate tiers (% of adult rate per category)
   infantRatePct:0,childRatePct:50,youngAdultRatePct:100,
   childParkFeeInfantPct:0,childParkFeeChildPct:50,childParkFeeYoungAdultPct:100,
@@ -476,6 +586,7 @@ const defaultForm={
   transports:[newTransport()],
   excursions:[{id:uid(),name:"",costPerPerson:""}],
   parkFees:[],
+  conferenceFacilities:[],
   serviceMarginPercent:10,
   itinerary:[{id:uid(),day:1,title:"",description:""},{id:uid(),day:2,title:"",description:""},{id:uid(),day:3,title:"",description:""}],
 };
@@ -885,6 +996,7 @@ function App(){
   const [expandAccom,setExpandAccom]=useState([0]);
   const [expandTransport,setExpandTransport]=useState([0]);
   const [expandPark,setExpandPark]=useState([]);
+  const [expandConf,setExpandConf]=useState([]);
 
   const totals=calcTotals(form,settings);
   const upd=useCallback((f,v)=>setForm(p=>{
@@ -940,6 +1052,13 @@ function App(){
   const removePark=useCallback((i)=>{setForm(p=>({...p,parkFees:p.parkFees.filter((_,idx)=>idx!==i)}));setExpandPark(p=>p.filter(x=>x!==i).map(x=>x>i?x-1:x));},[]);
   const togglePark=useCallback((i)=>setExpandPark(p=>p.includes(i)?p.filter(x=>x!==i):[...p,i]),[]);
 
+  // Conference / Meeting facilities
+  const updConf=useCallback((i,f,v)=>setForm(p=>({...p,conferenceFacilities:p.conferenceFacilities.map((c,idx)=>idx===i?{...c,[f]:v}:c)})),[]);
+  const updConfInclusion=useCallback((i,key,v)=>setForm(p=>({...p,conferenceFacilities:p.conferenceFacilities.map((c,idx)=>idx===i?{...c,inclusions:{...c.inclusions,[key]:v}}:c)})),[]);
+  const addConf=useCallback(()=>{setForm(p=>({...p,conferenceFacilities:[...p.conferenceFacilities,newConferenceFacility(p.pax)]}));setExpandConf(p=>[...p,p.length]);},[]);
+  const removeConf=useCallback((i)=>{setForm(p=>({...p,conferenceFacilities:p.conferenceFacilities.filter((_,idx)=>idx!==i)}));setExpandConf(p=>p.filter(x=>x!==i).map(x=>x>i?x-1:x));},[]);
+  const toggleConf=useCallback((i)=>setExpandConf(p=>p.includes(i)?p.filter(x=>x!==i):[...p,i]),[]);
+
   // Itinerary
   const updItin=useCallback((i,f,v)=>setForm(p=>({...p,itinerary:p.itinerary.map((d,idx)=>idx===i?{...d,[f]:v}:d)})),[]);
   const addDay=useCallback(()=>setForm(p=>({...p,itinerary:[...p.itinerary,{id:uid(),day:p.itinerary.length+1,title:"",description:""}]})),[]);
@@ -960,6 +1079,7 @@ function App(){
     {id:"transport",label:"🚗 Transport ("+form.transports.length+")"},
     {id:"excursions",label:"🎯 Excursions"},
     {id:"parks",label:"🎟️ Park Fees ("+form.parkFees.length+")"},
+    {id:"conference",label:"🏢 Conference ("+form.conferenceFacilities.length+")"},
     {id:"itinerary",label:"🗺️ Itinerary"},
     {id:"pricing",label:"💰 Pricing"},
   ];
@@ -1001,11 +1121,12 @@ function App(){
             color:tab===t.id?"#f5c500":"rgba(255,255,255,0.7)",fontWeight:tab===t.id?"bold":"normal"}},t.label))
       ),
       e("div",{className:"card"},
-        tab==="basics"&&e(TabBasics,{form,upd,settings}),
-        tab==="hotel"&&e(TabHotel,{form,updAccom,addAccom,removeAccom,toggleAccom,expandAccom,nightsMismatch,totals,sheetData,settings}),
-        tab==="transport"&&e(TabTransport,{form,updTrans,addTrans,removeTrans,toggleTrans,expandTransport,totals}),
+        tab==="basics"&&e(TabBasics,{form,upd,settings,totals}),
+        tab==="hotel"&&e(TabHotel,{form,upd,updAccom,addAccom,removeAccom,toggleAccom,expandAccom,nightsMismatch,totals,sheetData,settings}),
+        tab==="transport"&&e(TabTransport,{form,upd,updTrans,addTrans,removeTrans,toggleTrans,expandTransport,totals}),
         tab==="excursions"&&e(TabExcursions,{form,updExc,addExc,removeExc,totals}),
-        tab==="parks"&&e(TabParkFees,{form,updPark,addPark,removePark,togglePark,expandPark,totals,sheetData,settings}),
+        tab==="parks"&&e(TabParkFees,{form,upd,updPark,addPark,removePark,togglePark,expandPark,totals,sheetData,settings}),
+        tab==="conference"&&e(TabConference,{form,updConf,updConfInclusion,addConf,removeConf,toggleConf,expandConf,totals}),
         tab==="itinerary"&&e(TabItinerary,{form,updItin,addDay,removeDay}),
         tab==="pricing"&&e(TabPricing,{form,upd,totals,settings})
       )
@@ -1015,7 +1136,7 @@ function App(){
 }
 
 // ── TAB: BASICS ───────────────────────────────────────────────────────────
-function TabBasics({form,upd,settings}){
+function TabBasics({form,upd,settings,totals}){
   const CLIENT_TYPES=[
     {value:"Non-Resident",label:"Non-Resident / International",desc:"Foreign nationals — charged in USD or at non-resident KES rates"},
     {value:"Resident",label:"Kenyan Resident",desc:"Kenyan citizens and permanent residents — local KES rates apply"},
@@ -1075,9 +1196,7 @@ function TabBasics({form,upd,settings}){
         " Standard Kenya: Infant 0–2 free, Child 3–11 at 50%, Young Adult 12–17 at full rate."
       ),
       // PAX breakdown
-      e("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:"0 16px",marginBottom:4}},
-        e("div",{style:{marginBottom:14}},e("label",{className:"field-label"},"Total Children (under 18)"),
-          e("input",{className:"inp",type:"number",min:0,value:form.childrenTotal,onChange:ev=>upd("childrenTotal",ev.target.value)})),
+      e("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:"0 16px",marginBottom:4}},
         e("div",{style:{marginBottom:14}},e("label",{className:"field-label"},"Infants (0–2 yrs)"),
           e("input",{className:"inp",type:"number",min:0,value:form.infants,onChange:ev=>upd("infants",ev.target.value)})),
         e("div",{style:{marginBottom:14}},e("label",{className:"field-label"},"Children (3–11 yrs)"),
@@ -1087,44 +1206,21 @@ function TabBasics({form,upd,settings}){
       ),
       // Live breakdown
       e("div",{style:{display:"flex",gap:20,flexWrap:"wrap",background:"rgba(34,197,94,0.07)",border:"1px solid rgba(34,197,94,0.15)",borderRadius:8,padding:"10px 14px",marginBottom:14,fontSize:12,color:"rgba(255,255,255,0.55)"}},
-        e("span",null,"🧑 Adults: ",e("b",{style:{color:"#4ade80"}},Math.max(0,Number(form.pax)-Number(form.childrenTotal||0)))),
-        e("span",null,"👶 Total children: ",e("b",{style:{color:"#f5c500"}},Number(form.childrenTotal||0))),
+        e("span",null,"🧑 Adults: ",e("b",{style:{color:"#4ade80"}},Math.max(0,Number(form.pax)-(Number(form.infants||0)+Number(form.childrenAged||0)+Number(form.youngAdults||0))))),
+        e("span",null,"👶 Total children: ",e("b",{style:{color:"#f5c500"}},(Number(form.infants||0)+Number(form.childrenAged||0)+Number(form.youngAdults||0)))),
         Number(form.infants)>0&&e("span",null,"🍼 Infants (0–2): ",e("b",{style:{color:"#f5c500"}},form.infants)),
         Number(form.childrenAged)>0&&e("span",null,"🧒 Children (3–11): ",e("b",{style:{color:"#f5c500"}},form.childrenAged)),
         Number(form.youngAdults)>0&&e("span",null,"🧑‍🦱 Young Adults (12–17): ",e("b",{style:{color:"#f5c500"}},form.youngAdults))
       ),
-      // Rate tiers — ACCOMMODATION
-      Number(form.childrenTotal||0)>0&&e("div",{style:{marginBottom:14}},
-        e("div",{style:{fontSize:12,fontWeight:"bold",color:"#f5c500",letterSpacing:1,textTransform:"uppercase",marginBottom:8}},"🏨 Accommodation Rate Tiers (% of adult rate)"),
-        e("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:"0 16px"}},[
-          ["Infant (0–2) %","infantRatePct","🍼 Usually FREE — set 0"],
-          ["Child (3–11) %","childRatePct","🧒 Typically 50% of adult"],
-          ["Young Adult (12–17) %","youngAdultRatePct","🧑 Usually 75–100% of adult"],
-        ].map(([label,key,hint])=>
-          e("div",{key,style:{marginBottom:10}},
-            e("label",{className:"field-label"},label),
-            e("input",{className:"inp",type:"number",min:0,max:100,value:form[key],onChange:ev=>upd(key,ev.target.value)}),
-            e("div",{style:{fontSize:10,color:"rgba(255,255,255,0.35)",marginTop:3}},hint)
-          )
-        ))
-      ),
-      // Rate tiers — PARK FEES
-      Number(form.childrenTotal||0)>0&&e("div",{style:{marginBottom:14}},
-        e("div",{style:{fontSize:12,fontWeight:"bold",color:"#f5c500",letterSpacing:1,textTransform:"uppercase",marginBottom:8}},"🎟️ Park Fee Tiers (% of adult rate)"),
-        e("div",{style:{fontSize:11,color:"rgba(255,255,255,0.4)",marginBottom:8}},
-          "KWS standard: Under 3 = FREE. Age 3–18 = 50% resident, varies non-resident. Confirm per park."
-        ),
-        e("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:"0 16px"}},[
-          ["Infant Park Fee %","childParkFeeInfantPct","Standard: FREE (0%)"],
-          ["Child Park Fee %","childParkFeeChildPct","Standard: 50% of adult"],
-          ["Young Adult Park Fee %","childParkFeeYoungAdultPct","Check per park"],
-        ].map(([label,key,hint])=>
-          e("div",{key,style:{marginBottom:10}},
-            e("label",{className:"field-label"},label),
-            e("input",{className:"inp",type:"number",min:0,max:100,value:form[key],onChange:ev=>upd(key,ev.target.value)}),
-            e("div",{style:{fontSize:10,color:"rgba(255,255,255,0.35)",marginTop:3}},hint)
-          )
-        ))
+      // Vehicle seating — children normally need their own seat
+      // Note: accommodation/park-fee child rate tiers and vehicle seat-sharing
+      // are configured on their respective tabs (Accommodation, Park Fees, Transport)
+      // so the inputs sit right next to the calculation they affect.
+      totals&&totals.hasChildren&&e("div",{style:{marginBottom:14,display:"flex",gap:10,flexWrap:"wrap",fontSize:11,color:"rgba(255,255,255,0.4)"}},
+        e("span",null,"👉 Accommodation rates: "),e("b",{style:{color:"#f5c500"}},"Accommodation tab"),
+        e("span",null," · 👉 Park fee rates: "),e("b",{style:{color:"#f5c500"}},"Park Fees tab"),
+        e("span",null," · 👉 Vehicle seat sharing: "),e("b",{style:{color:"#f5c500"}},"Transport tab"),
+        e("span",null," · 👉 Full cost breakdown: "),e("b",{style:{color:"#f5c500"}},"Pricing tab")
       ),
       e("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"0 16px"}},
         e("div",{style:{marginBottom:14}},
@@ -1132,11 +1228,24 @@ function TabBasics({form,upd,settings}){
           e("input",{className:"inp",value:form.childAges,placeholder:"e.g. 1, 4, 9, 14",onChange:ev=>upd("childAges",ev.target.value)})
         ),
         e("div",{style:{marginBottom:14}},
-          e("label",{className:"field-label"},"Sharing Arrangement"),
-          e("select",{className:"sel",value:form.childrenSharing,onChange:ev=>upd("childrenSharing",ev.target.value)},
-            ["","Sharing with parents / adults","Children in own room / tent",
-             "Mix — some sharing, some own room","Infants in cot (not occupying bed)",
-             "To be confirmed"].map(v=>e("option",{key:v,value:v},v||"— Select —"))
+          e("label",{className:"field-label"},"Sharing Arrangements (tick all that apply)"),
+          e("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"4px 10px",marginTop:6}},
+            [["with_parents","Sharing with parents / adults"],
+             ["own_room","Children in own room / tent"],
+             ["share_each_other","Children sharing with each other"],
+             ["infant_cot","Infants in cot (not occupying bed)"],
+             ["single_occupancy","Each child in own bed / single occupancy"],
+             ["tbc","To be confirmed"]
+            ].map(([key,label])=>{
+              const arr=(form.childrenSharing||"").split(",").filter(Boolean);
+              const checked=arr.includes(key);
+              return e("label",{key,style:{display:"flex",alignItems:"center",gap:6,fontSize:12,color:"rgba(255,255,255,0.75)",cursor:"pointer"}},
+                e("input",{type:"checkbox",checked,onChange:ev=>{
+                  const next=ev.target.checked?[...arr,key]:arr.filter(x=>x!==key);
+                  upd("childrenSharing",next.join(","));
+                }}),label
+              );
+            })
           )
         )
       )
@@ -1698,7 +1807,7 @@ function MealCardSection({accom,idx,updAccom}){
   );
 }
 
-function TabHotel({form,updAccom,addAccom,removeAccom,toggleAccom,expandAccom,nightsMismatch,totals,sheetData,settings}){
+function TabHotel({form,upd,updAccom,addAccom,removeAccom,toggleAccom,expandAccom,nightsMismatch,totals,sheetData,settings}){
   return e("div",null,
     e("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}},
       e("div",{className:"section-head",style:{margin:0}},"Accommodation Stops"),
@@ -1832,27 +1941,89 @@ function TabHotel({form,updAccom,addAccom,removeAccom,toggleAccom,expandAccom,ni
           )
         )
       )
+    ),
+    // ── CHILD/YOUNG-ADULT ACCOMMODATION RATE TIERS — lives here since it only affects accommodation pricing ──
+    totals.hasChildren&&e("div",{style:{marginTop:18}},
+      e("div",{className:"section-head",style:{fontSize:14}},"👶 Accommodation Rate Tiers (% of adult rate)"),
+      e("div",{style:{fontSize:12,color:"rgba(255,255,255,0.45)",marginBottom:14,lineHeight:1.7,padding:"10px 14px",background:"rgba(245,197,0,0.05)",border:"1px solid rgba(245,197,0,0.12)",borderRadius:8}},
+        "⚠️ Different lodges charge children differently for accommodation. Set the tiers here — they're applied automatically to the accommodation portion of the group total. ",
+        e("b",{style:{color:"#f5c500"}},"Rates are % of the adult accommodation rate."),
+        " Standard Kenya: Infant 0–2 free, Child 3–11 at 50%, Young Adult 12–17 at full rate."
+      ),
+      e("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:"0 16px"}},[
+        ["Infant (0–2) %","infantRatePct","🍼 Usually FREE — set 0"],
+        ["Child (3–11) %","childRatePct","🧒 Typically 50% of adult"],
+        ["Young Adult (12–17) %","youngAdultRatePct","🧑 Usually 75–100% of adult"],
+      ].map(([label,key,hint])=>
+        e("div",{key,style:{marginBottom:10}},
+          e("label",{className:"field-label"},label),
+          e("input",{className:"inp",type:"number",min:0,max:100,value:form[key],onChange:ev=>upd(key,ev.target.value)}),
+          e("div",{style:{fontSize:10,color:"rgba(255,255,255,0.35)",marginTop:3}},hint)
+        )
+      )),
+      // Live preview of accommodation-only cost per category, calculated right here
+      e("div",{style:{marginTop:12,background:"rgba(0,0,0,0.15)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:8,padding:"12px 14px"}},
+        e("div",{style:{fontSize:11,fontWeight:"bold",color:"#5cef80",letterSpacing:1,textTransform:"uppercase",marginBottom:8}},"💰 Accommodation Cost by Category (per stay)"),
+        e("table",{style:{width:"100%",fontSize:13,borderCollapse:"collapse"}},
+          e("thead",null,e("tr",{style:{color:"rgba(255,255,255,0.4)",fontSize:11,textTransform:"uppercase"}},
+            e("th",{style:{textAlign:"left",padding:"4px 6px"}},"Category"),
+            e("th",{style:{textAlign:"right",padding:"4px 6px"}},"Rate %"),
+            e("th",{style:{textAlign:"right",padding:"4px 6px"}},"Accom. Cost Each")
+          )),
+          e("tbody",null,
+            [["adult","🧑 Adult",100],["infant","🍼 Infant",Number(form.infantRatePct)||0],
+             ["child","🧒 Child",Number(form.childRatePct)||0],["youngAdult","🧑‍🦱 Young Adult",Number(form.youngAdultRatePct)||0]
+            ].filter(([k])=>totals.categories[k].count>0).map(([k,label,pct])=>
+              e("tr",{key:k,style:{borderTop:"1px solid rgba(255,255,255,0.06)"}},
+                e("td",{style:{padding:"6px 6px",color:"rgba(255,255,255,0.75)"}},label+" ×"+totals.categories[k].count),
+                e("td",{style:{textAlign:"right",padding:"6px 6px"}},pct+"%"),
+                e("td",{style:{textAlign:"right",padding:"6px 6px",fontWeight:"bold",color:"#5cef80"}},fmt(totals.accomCPP*(pct/100)))
+              )
+            )
+          )
+        ),
+        e("div",{style:{fontSize:11,color:"rgba(255,255,255,0.35)",marginTop:8,fontStyle:"italic"}},
+          "Full breakdown including transport, park fees & margin is on the Pricing tab."
+        )
+      )
     )
   );
 }
 
 // ── TAB: TRANSPORT ─────────────────────────────────────────────────────────
-function TabTransport({form,updTrans,addTrans,removeTrans,toggleTrans,expandTransport,totals}){
+function TabTransport({form,upd,updTrans,addTrans,removeTrans,toggleTrans,expandTransport,totals}){
   const pax=Number(form.pax)||1;
+  // Vehicle SEATS needed — every guest counts as a full seat UNLESS marked as
+  // sharing a lap seat with an adult (set in the Trip Details / Child Policy tab).
+  // Cost-sharing (cpp below) still divides across the full pax count.
+  const lapInfants=Math.min(Number(form.lapInfants||0),Number(form.infants||0));
+  const seatsRequired=Math.max(1,pax-lapInfants);
 
   return e("div",null,
     e("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}},
       e("div",{className:"section-head",style:{margin:0}},"Transport & Transfers"),
       e("button",{className:"btn-outline",onClick:addTrans},"+ Add Transport")
     ),
+    // Lap-infant seating — only shown when infants are in the group
+    Number(form.infants)>0&&e("div",{style:{display:"flex",alignItems:"center",gap:12,background:"rgba(99,102,241,0.06)",border:"1px solid rgba(99,102,241,0.15)",borderRadius:8,padding:"10px 14px",marginBottom:12,fontSize:12}},
+      e("span",{style:{color:"#a5b4fc",flex:1}},
+        "🚐 Of the ",e("b",null,form.infants)," infant(s), how many will sit on a lap (no extra vehicle seat needed)?"
+      ),
+      e("input",{className:"inp",style:{width:64,textAlign:"center"},type:"number",min:0,max:Number(form.infants)||0,
+        value:form.lapInfants||0,
+        onChange:ev=>upd("lapInfants",Math.max(0,Math.min(Number(form.infants)||0,Number(ev.target.value)||0)))}),
+      e("span",{style:{color:"rgba(255,255,255,0.35)",fontSize:11}},
+        seatsRequired+" seat"+(seatsRequired!==1?"s":"")+" required"
+      )
+    ),
     // Vehicle logic explainer
     e("div",{style:{padding:"10px 14px",background:"rgba(245,197,0,0.06)",border:"1px solid rgba(245,197,0,0.18)",borderRadius:8,fontSize:12,color:"rgba(255,255,255,0.55)",marginBottom:14}},
-      "🚗 Vehicles are charged ",e("b",null,"per vehicle"),", not per person. Enter the vehicle day rate and number of days — the system divides total cost across all ",e("b",null,pax)," pax automatically. If group size exceeds vehicle capacity, an additional vehicle or upgrade is suggested."
+      "🚗 Vehicles are charged ",e("b",null,"per vehicle"),", not per person. Enter the vehicle day rate and number of days — the system divides total cost across all ",e("b",null,pax)," pax automatically. Children count as a full seat for vehicle sizing"+(lapInfants>0?" (except "+lapInfants+" lap infant(s) — "+seatsRequired+" seats required)":"")+". If group size exceeds vehicle capacity, an additional vehicle or upgrade is suggested."
     ),
     form.transports.map((t,i)=>{
       const isOpen=expandTransport.includes(i);
       // Vehicle suggestion based on pax
-      const suggestions=suggestVehicles(pax);
+      const suggestions=suggestVehicles(seatsRequired);
       const suggested=suggestions[0];
       const fleetEntry=VEHICLE_FLEET.find(v=>v.type===t.vehicleType)||VEHICLE_FLEET[0];
       const numV=Number(t.numVehicles)||1;
@@ -1860,17 +2031,20 @@ function TabTransport({form,updTrans,addTrans,removeTrans,toggleTrans,expandTran
       const ratePerVeh=Number(t.vehicleCostPerDay)||0;
       const totalVehicleCost=ratePerVeh*days*numV;
       const cpp=pax>0?totalVehicleCost/pax:0;
-      // Capacity warning
+      // Capacity warning — not applicable for scheduled public transport (SGR / Bus / Flight)
+      const isScheduledFare=SCHEDULED_FARE_TYPES.includes(t.transportType);
       const totalCap=(fleetEntry.capacity||4)*numV;
-      const capacityOk=totalCap>=pax||t.vehicleType==="N/A";
+      const capacityOk=isScheduledFare||totalCap>=seatsRequired||t.vehicleType==="N/A";
       const isOverland=t.vehicleType&&t.vehicleType.includes("Overland");
 
       // Summary for collapsed header
       const summaryParts=[];
       if(t.fromLocation&&t.toLocation)summaryParts.push(t.fromLocation+" → "+t.toLocation);
-      else if(t.vehicleType)summaryParts.push(t.vehicleType);
-      if(t.pricingBasis==="per_person"&&t.costPerPerson)summaryParts.push(fmt(Number(t.costPerPerson))+"/pax");
-      else if(cpp>0)summaryParts.push(fmt(cpp)+"/pax ("+numV+" veh.)");
+      else if(!isScheduledFare&&t.vehicleType)summaryParts.push(t.vehicleType);
+      if(t.pricingBasis==="per_person"&&isScheduledFare&&scheduledFareCPP(t)>0)
+        summaryParts.push((t.serviceClass||"Economy")+" · "+((t.tripType||"one_way")==="return"?"Return":"One Way")+" · "+fmt(scheduledFareCPP(t))+"/pax");
+      else if(t.pricingBasis==="per_person"&&t.costPerPerson)summaryParts.push(fmt(Number(t.costPerPerson))+"/pax");
+      else if(!isScheduledFare&&cpp>0)summaryParts.push(fmt(cpp)+"/pax ("+numV+" veh.)");
 
       return e("div",{key:t.id,className:"accom-card"},
         // ── Header ────────────────────────────────────────────────────
@@ -1897,7 +2071,11 @@ function TabTransport({form,updTrans,addTrans,removeTrans,toggleTrans,expandTran
               e("input",{className:"inp",value:t.label,onChange:ev=>updTrans(i,"label",ev.target.value),placeholder:"e.g. JKIA → Mara Serena Transfer"})
             ),
             e("div",{style:{marginBottom:16}},e("label",{className:"field-label"},"Transport Type"),
-              e("select",{className:"sel",value:t.transportType,onChange:ev=>updTrans(i,"transportType",ev.target.value)},
+              e("select",{className:"sel",value:t.transportType,onChange:ev=>{
+                  const v=ev.target.value;
+                  updTrans(i,"transportType",v);
+                  if(SCHEDULED_FARE_TYPES.includes(v)&&t.pricingBasis!=="per_person")updTrans(i,"pricingBasis","per_person");
+                }},
                 TRANSPORT_TYPES.map(r=>e("option",{key:r,value:r},r))
               )
             ),
@@ -1909,13 +2087,13 @@ function TabTransport({form,updTrans,addTrans,removeTrans,toggleTrans,expandTran
             )
           ),
 
-          // ── Pricing Basis toggle ──────────────────────────────────────
-          e("div",{style:{marginBottom:12}},
+          // ── Pricing Basis toggle — hidden for scheduled fares (always per-person) ──
+          !isScheduledFare&&e("div",{style:{marginBottom:12}},
             e("div",{style:{fontSize:11,fontWeight:"bold",color:"rgba(255,255,255,0.45)",textTransform:"uppercase",letterSpacing:1,marginBottom:6}},"How is this charged?"),
             e("div",{style:{display:"flex",gap:6}},
               [
                 {v:"per_vehicle",l:"Per Vehicle / Day"},
-                {v:"per_person", l:"Per Person (SGR/Shuttle)"},
+                {v:"per_person", l:"Per Person (flat)"},
                 {v:"per_trip",   l:"Per Trip (flat)"},
               ].map(({v,l})=>
                 e("button",{key:v,onClick:()=>updTrans(i,"pricingBasis",v),
@@ -1927,12 +2105,15 @@ function TabTransport({form,updTrans,addTrans,removeTrans,toggleTrans,expandTran
               )
             )
           ),
+          isScheduledFare&&e("div",{style:{padding:"8px 12px",background:"rgba(99,102,241,0.08)",border:"1px solid rgba(99,102,241,0.2)",borderRadius:7,fontSize:12,color:"rgba(255,255,255,0.55)",marginBottom:12}},
+            "🚉 Public transport — fares are per person. Vehicle capacity warnings do not apply."
+          ),
 
-          // ── Per-vehicle fields ────────────────────────────────────────
-          (t.pricingBasis||"per_vehicle")==="per_vehicle"&&e("div",null,
+          // ── Per-vehicle fields — hidden for scheduled fares ───────────
+          !isScheduledFare&&(t.pricingBasis||"per_vehicle")==="per_vehicle"&&e("div",null,
             // Auto-suggest banner
             suggested&&e("div",{style:{padding:"8px 12px",background:"rgba(99,102,241,0.1)",border:"1px solid rgba(99,102,241,0.25)",borderRadius:7,fontSize:12,marginBottom:10}},
-              e("span",{style:{color:"#a5b4fc",fontWeight:"bold"}},"💡 Suggested for "+pax+" pax: "),
+              e("span",{style:{color:"#a5b4fc",fontWeight:"bold"}},"💡 Suggested for "+seatsRequired+" seat(s)"+(lapInfants>0?" ("+pax+" pax − "+lapInfants+" lap infant)":"")+": "),
               e("span",{style:{color:"rgba(255,255,255,0.7)"}},
                 suggested.count>1?suggested.count+"× ":"",(suggested.vehicle.type),
                 " (capacity: "+suggested.vehicle.capacity+" pax each)",
@@ -2005,7 +2186,77 @@ function TabTransport({form,updTrans,addTrans,removeTrans,toggleTrans,expandTran
           ),
 
           // ── Per-person fields (SGR / shuttle) ─────────────────────────
-          t.pricingBasis==="per_person"&&e("div",{style:{marginBottom:8}},
+          t.pricingBasis==="per_person"&&SCHEDULED_FARE_TYPES.includes(t.transportType)&&e("div",{style:{marginBottom:8}},
+            e("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"0 12px",marginBottom:10}},
+              e("div",null,
+                e("label",{style:{fontSize:10,color:"rgba(255,255,255,0.4)",display:"block",marginBottom:3,textTransform:"uppercase",letterSpacing:0.5}},"Service Class"),
+                e("select",{className:"sel",style:{fontSize:12},value:t.serviceClass||"Economy",
+                  onChange:ev=>updTrans(i,"serviceClass",ev.target.value)},
+                  (SERVICE_CLASSES[t.transportType]||["Economy"]).map(c=>e("option",{key:c,value:c},c))
+                )
+              ),
+              e("div",null,
+                e("label",{style:{fontSize:10,color:"rgba(255,255,255,0.4)",display:"block",marginBottom:3,textTransform:"uppercase",letterSpacing:0.5}},"Direction"),
+                e("div",{style:{display:"flex",gap:6}},
+                  [{v:"one_way",l:"One Way"},{v:"return",l:"Return"}].map(({v,l})=>
+                    e("button",{key:v,onClick:()=>updTrans(i,"tripType",v),
+                      style:{flex:1,padding:"6px 4px",border:"2px solid",fontSize:11,fontFamily:"Georgia,serif",cursor:"pointer",borderRadius:7,
+                        borderColor:(t.tripType||"one_way")===v?"#f5c500":"rgba(255,255,255,0.15)",
+                        background:(t.tripType||"one_way")===v?"rgba(245,197,0,0.12)":"transparent",
+                        color:(t.tripType||"one_way")===v?"#f5c500":"rgba(255,255,255,0.4)"}},l)
+                  )
+                )
+              )
+            ),
+            e("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"0 12px",marginBottom:8}},
+              e("div",null,
+                e("label",{style:{fontSize:10,color:"rgba(255,255,255,0.4)",display:"block",marginBottom:3,textTransform:"uppercase",letterSpacing:0.5}},"One Way Fare (KES/person)"),
+                e("input",{className:"inp",type:"number",value:t.oneWayFare||"",style:{fontSize:12,padding:"5px 8px"},
+                  placeholder:"e.g. 12000",onChange:ev=>updTrans(i,"oneWayFare",ev.target.value)})
+              ),
+              e("div",null,
+                e("label",{style:{fontSize:10,color:"rgba(255,255,255,0.4)",display:"block",marginBottom:3,textTransform:"uppercase",letterSpacing:0.5}},"Return Fare (KES/person)"),
+                e("input",{className:"inp",type:"number",value:t.returnFare||"",style:{fontSize:12,padding:"5px 8px"},
+                  placeholder:"e.g. 20000",onChange:ev=>updTrans(i,"returnFare",ev.target.value)})
+              )
+            ),
+            e("div",{style:{fontSize:11,color:"rgba(255,255,255,0.35)",marginBottom:8,fontStyle:"italic"}},
+              "Return is rarely 2× one-way — enter both fares as quoted by the operator."
+            ),
+            // Child fares for scheduled transport
+            totals.hasChildren&&e("div",{style:{marginTop:8,padding:"10px 12px",background:"rgba(99,102,241,0.06)",border:"1px solid rgba(99,102,241,0.18)",borderRadius:7}},
+              e("div",{style:{fontSize:11,fontWeight:"bold",color:"#a5b4fc",marginBottom:8,textTransform:"uppercase",letterSpacing:0.5}},"👶 Child Fares on this Service"),
+              e("div",{style:{fontSize:11,color:"rgba(255,255,255,0.4)",marginBottom:8,fontStyle:"italic"}},
+                "Infants (0–2) are normally free. Children (3–11) may pay half or a set rate. Adjust per the operator."
+              ),
+              e("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:"0 10px"}},
+                e("div",null,
+                  e("label",{style:{fontSize:10,color:"rgba(255,255,255,0.4)",display:"block",marginBottom:3,textTransform:"uppercase",letterSpacing:0.5}},"Infant Fare (KES)"),
+                  e("input",{className:"inp",type:"number",min:0,value:t.infantFare||"0",style:{fontSize:12,padding:"5px 8px"},
+                    placeholder:"0",onChange:ev=>updTrans(i,"infantFare",ev.target.value)}),
+                  e("div",{style:{fontSize:10,color:"rgba(255,255,255,0.3)",marginTop:2}},"Default: FREE")
+                ),
+                e("div",null,
+                  e("label",{style:{fontSize:10,color:"rgba(255,255,255,0.4)",display:"block",marginBottom:3,textTransform:"uppercase",letterSpacing:0.5}},"Child Fare (KES)"),
+                  e("input",{className:"inp",type:"number",min:0,value:t.childFare||"",style:{fontSize:12,padding:"5px 8px"},
+                    placeholder:"e.g. 6000",onChange:ev=>updTrans(i,"childFare",ev.target.value)}),
+                  e("div",{style:{fontSize:10,color:"rgba(255,255,255,0.3)",marginTop:2}},
+                    "Blank = adult rate. Typical: half.")
+                ),
+                e("div",null,
+                  e("label",{style:{fontSize:10,color:"rgba(255,255,255,0.4)",display:"block",marginBottom:3,textTransform:"uppercase",letterSpacing:0.5}},"Young Adult Fare"),
+                  e("input",{className:"inp",type:"number",min:0,value:t.youngAdultFare||"",style:{fontSize:12,padding:"5px 8px"},
+                    placeholder:"Blank = adult",onChange:ev=>updTrans(i,"youngAdultFare",ev.target.value)}),
+                  e("div",{style:{fontSize:10,color:"rgba(255,255,255,0.3)",marginTop:2}},"Blank = adult rate")
+                )
+              )
+            ),
+            scheduledFareCPP(t)>0&&e("div",{style:{fontSize:12,color:"#5cef80",marginTop:8}},
+              fmt(scheduledFareCPP(t))," (",t.serviceClass||"Economy"," · ",(t.tripType||"one_way")==="return"?"Return":"One Way",") × "+pax+" pax = ",e("b",null,fmt(scheduledFareCPP(t)*pax))," total"
+            )
+          ),
+
+          t.pricingBasis==="per_person"&&!SCHEDULED_FARE_TYPES.includes(t.transportType)&&e("div",{style:{marginBottom:8}},
             e("div",null,
               e("label",{style:{fontSize:10,color:"rgba(255,255,255,0.4)",display:"block",marginBottom:3,textTransform:"uppercase",letterSpacing:0.5}},"Cost per Person (KES)"),
               e("input",{className:"inp",type:"number",value:t.costPerPerson||"",style:{fontSize:12,padding:"5px 8px"},
@@ -2016,8 +2267,8 @@ function TabTransport({form,updTrans,addTrans,removeTrans,toggleTrans,expandTran
             )
           ),
 
-          // ── Per-trip flat cost ────────────────────────────────────────
-          t.pricingBasis==="per_trip"&&e("div",{style:{marginBottom:8}},
+          // ── Per-trip flat cost — not for scheduled public transport ──────
+          !isScheduledFare&&t.pricingBasis==="per_trip"&&e("div",{style:{marginBottom:8}},
             e("div",null,
               e("label",{style:{fontSize:10,color:"rgba(255,255,255,0.4)",display:"block",marginBottom:3,textTransform:"uppercase",letterSpacing:0.5}},"Total Trip Cost (KES)"),
               e("input",{className:"inp",type:"number",value:t.vehicleCostPerDay||"",style:{fontSize:12,padding:"5px 8px"},
@@ -2120,14 +2371,14 @@ function TabTransport({form,updTrans,addTrans,removeTrans,toggleTrans,expandTran
 }
 
 
-function TabParkFees({form,updPark,addPark,removePark,togglePark,expandPark,totals,sheetData,settings}){
+function TabParkFees({form,upd,updPark,addPark,removePark,togglePark,expandPark,totals,sheetData,settings}){
   const parkRows=sheetData.parks||[];
   const pax=Number(form.pax)||1;
-  const adults=Math.max(0,pax-Number(form.childrenTotal||0));
+  const adults=Math.max(0,pax-(Number(form.infants||0)+Number(form.childrenAged||0)+Number(form.youngAdults||0)));
   const infants=Number(form.infants||0);
   const children=Number(form.childrenAged||0);
   const youngAdults=Number(form.youngAdults||0);
-  const hasKids=Number(form.childrenTotal||0)>0;
+  const hasKids=(Number(form.infants||0)+Number(form.childrenAged||0)+Number(form.youngAdults||0))>0;
 
   function getRate(row,nat){
     if(!row)return"";
@@ -2373,7 +2624,171 @@ function TabParkFees({form,updPark,addPark,removePark,togglePark,expandPark,tota
     // Summary
     form.parkFees.some(p=>p.includedInPackage&&p.costPerPerson)&&
     e("div",{style:{marginTop:12,padding:"12px 16px",background:"rgba(92,239,128,0.08)",borderRadius:8,fontSize:13}},
-      "Park fees in package (per person): ",e("b",{style:{color:"#5cef80"}},fmt(totals.parkIncCPP)))
+      "Park fees in package (per person): ",e("b",{style:{color:"#5cef80"}},fmt(totals.parkIncCPP))),
+    // ── CHILD/YOUNG-ADULT PARK FEE RATE TIERS — lives here since it only affects park fee pricing ──
+    totals.hasChildren&&e("div",{style:{marginTop:18}},
+      e("div",{className:"section-head",style:{fontSize:14}},"👶 Park Fee Tiers (% of adult rate)"),
+      e("div",{style:{fontSize:11,color:"rgba(255,255,255,0.4)",marginBottom:8,padding:"10px 14px",background:"rgba(245,197,0,0.05)",border:"1px solid rgba(245,197,0,0.12)",borderRadius:8}},
+        "KWS standard: Under 3 = FREE. Age 3–18 = 50% resident, varies non-resident. Confirm per park — these tiers apply across all park fees marked 'included in package' above."
+      ),
+      e("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:"0 16px"}},[
+        ["Infant Park Fee %","childParkFeeInfantPct","Standard: FREE (0%)"],
+        ["Child Park Fee %","childParkFeeChildPct","Standard: 50% of adult"],
+        ["Young Adult Park Fee %","childParkFeeYoungAdultPct","Check per park"],
+      ].map(([label,key,hint])=>
+        e("div",{key,style:{marginBottom:10}},
+          e("label",{className:"field-label"},label),
+          e("input",{className:"inp",type:"number",min:0,max:100,value:form[key],onChange:ev=>upd(key,ev.target.value)}),
+          e("div",{style:{fontSize:10,color:"rgba(255,255,255,0.35)",marginTop:3}},hint)
+        )
+      )),
+      // Live preview of park-fee-only cost per category, calculated right here
+      e("div",{style:{marginTop:12,background:"rgba(0,0,0,0.15)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:8,padding:"12px 14px"}},
+        e("div",{style:{fontSize:11,fontWeight:"bold",color:"#5cef80",letterSpacing:1,textTransform:"uppercase",marginBottom:8}},"💰 Park Fee Cost by Category (per person)"),
+        e("table",{style:{width:"100%",fontSize:13,borderCollapse:"collapse"}},
+          e("thead",null,e("tr",{style:{color:"rgba(255,255,255,0.4)",fontSize:11,textTransform:"uppercase"}},
+            e("th",{style:{textAlign:"left",padding:"4px 6px"}},"Category"),
+            e("th",{style:{textAlign:"right",padding:"4px 6px"}},"Park Fee Each")
+          )),
+          e("tbody",null,
+            [["adult","🧑 Adult"],["infant","🍼 Infant"],["child","🧒 Child"],["youngAdult","🧑‍🦱 Young Adult"]
+            ].filter(([k])=>totals.categories[k].count>0).map(([k,label])=>
+              e("tr",{key:k,style:{borderTop:"1px solid rgba(255,255,255,0.06)"}},
+                e("td",{style:{padding:"6px 6px",color:"rgba(255,255,255,0.75)"}},label+" ×"+totals.categories[k].count),
+                e("td",{style:{textAlign:"right",padding:"6px 6px",fontWeight:"bold",color:"#5cef80"}},fmt(totals.parkRateByCategory[k]))
+              )
+            )
+          )
+        ),
+        e("div",{style:{fontSize:11,color:"rgba(255,255,255,0.35)",marginTop:8,fontStyle:"italic"}},
+          "Full breakdown including accommodation, transport & margin is on the Pricing tab."
+        )
+      )
+    )
+  );
+}
+
+
+// ── TAB: CONFERENCE / MEETING FACILITY ──────────────────────────────────────
+function TabConference({form,updConf,updConfInclusion,addConf,removeConf,toggleConf,expandConf,totals}){
+  const pax=Number(form.pax)||1;
+  return e("div",null,
+    e("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}},
+      e("div",{className:"section-head",style:{margin:0}},"Conference & Meeting Facilities"),
+      e("button",{className:"btn-outline",onClick:addConf},"+ Add Facility")
+    ),
+    form.conferenceFacilities.length===0&&e("div",{style:{padding:"14px 16px",background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.08)",borderRadius:8,fontSize:13,color:"rgba(255,255,255,0.4)"}},
+      "No conference or meeting facilities added. Use this tab for corporate retreats, workshops, or any booking that includes hall hire."
+    ),
+    form.conferenceFacilities.map((c,i)=>{
+      const isOpen=expandConf.includes(i);
+      const delegates=Number(c.numDelegates)||pax;
+      const days=Number(c.numDays)||1;
+      const cpp=conferenceFacilityCPP(c,pax);
+      const total=cpp*pax;
+      const inc=c.inclusions||{};
+      const incList=Object.entries({teaBreaks:"Tea/Coffee Breaks",lunch:"Lunch",projector:"LCD Projector",screen:"Screen",flipchart:"Flipchart",wifi:"WiFi",paSystem:"PA System",stationery:"Stationery",bottledWater:"Bottled Water"})
+        .filter(([k])=>inc[k]).map(([,l])=>l);
+
+      return e("div",{key:c.id,className:"accom-card"},
+        e("div",{className:"accom-header",style:{background:isOpen?"rgba(245,197,0,0.12)":"rgba(255,255,255,0.04)"},onClick:()=>toggleConf(i)},
+          e("div",{style:{display:"flex",alignItems:"center",gap:12}},
+            e("div",{className:"badge"},"🏢"),
+            e("div",null,
+              e("div",{style:{fontWeight:"bold",fontSize:14}},c.facilityName||"Conference Facility "+(i+1)),
+              e("div",{style:{fontSize:12,color:"rgba(255,255,255,0.5)",marginTop:2}},
+                [c.venue,c.packageType,delegates+" delegates × "+days+"d",cpp>0?fmt(cpp)+"/pax":null].filter(Boolean).join(" · ")
+              )
+            )
+          ),
+          e("div",{style:{display:"flex",gap:8,alignItems:"center"}},
+            e("button",{className:"btn-danger",onClick:ev=>{ev.stopPropagation();removeConf(i);}},"Remove"),
+            e("span",{style:{color:"#f5c500",fontSize:16,transform:isOpen?"rotate(180deg)":"none",display:"inline-block",transition:"0.2s"}},"▾")
+          )
+        ),
+        isOpen&&e("div",{className:"accom-body"},
+          e("div",{className:"grid2",style:{marginBottom:12}},
+            e("div",{style:{marginBottom:16}},e("label",{className:"field-label"},"Facility / Hotel Name"),
+              e("input",{className:"inp",value:c.facilityName,onChange:ev=>updConf(i,"facilityName",ev.target.value),placeholder:"e.g. Safari Park Hotel Conference Centre"})
+            ),
+            e("div",{style:{marginBottom:16}},e("label",{className:"field-label"},"Venue / Hall"),
+              e("input",{className:"inp",value:c.venue,onChange:ev=>updConf(i,"venue",ev.target.value),placeholder:"e.g. Simba Hall"})
+            ),
+            e("div",{style:{marginBottom:16}},e("label",{className:"field-label"},"Date"),
+              e("input",{className:"inp",type:"date",value:c.date,onChange:ev=>updConf(i,"date",ev.target.value)})
+            ),
+            e("div",{style:{marginBottom:16}},e("label",{className:"field-label"},"Package Type"),
+              e("select",{className:"sel",value:c.packageType,onChange:ev=>updConf(i,"packageType",ev.target.value)},
+                CONFERENCE_PACKAGE_TYPES.map(p=>e("option",{key:p,value:p},p))
+              )
+            )
+          ),
+          // Pricing basis toggle
+          e("div",{style:{marginBottom:12}},
+            e("div",{style:{fontSize:11,fontWeight:"bold",color:"rgba(255,255,255,0.45)",textTransform:"uppercase",letterSpacing:1,marginBottom:6}},"How is this charged?"),
+            e("div",{style:{display:"flex",gap:6}},
+              [{v:"per_delegate",l:"Per Delegate / Day"},{v:"flat_day_rate",l:"Flat Hall Rate / Day"}].map(({v,l})=>
+                e("button",{key:v,onClick:()=>updConf(i,"pricingBasis",v),
+                  style:{flex:1,padding:"6px 4px",border:"2px solid",fontSize:11,fontFamily:"Georgia,serif",cursor:"pointer",borderRadius:7,
+                    borderColor:(c.pricingBasis||"per_delegate")===v?"#f5c500":"rgba(255,255,255,0.15)",
+                    background:(c.pricingBasis||"per_delegate")===v?"rgba(245,197,0,0.12)":"transparent",
+                    color:(c.pricingBasis||"per_delegate")===v?"#f5c500":"rgba(255,255,255,0.4)"}},l
+                )
+              )
+            )
+          ),
+          e("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:"0 12px",marginBottom:8}},
+            (c.pricingBasis||"per_delegate")==="per_delegate"
+              ?e("div",null,
+                  e("label",{style:{fontSize:10,color:"rgba(255,255,255,0.4)",display:"block",marginBottom:3,textTransform:"uppercase",letterSpacing:0.5}},"Rate per Delegate/Day (KES)"),
+                  e("input",{className:"inp",type:"number",value:c.ratePerDelegate||"",style:{fontSize:12,padding:"5px 8px"},
+                    placeholder:"e.g. 3500",onChange:ev=>updConf(i,"ratePerDelegate",ev.target.value)})
+                )
+              :e("div",null,
+                  e("label",{style:{fontSize:10,color:"rgba(255,255,255,0.4)",display:"block",marginBottom:3,textTransform:"uppercase",letterSpacing:0.5}},"Flat Hall Rate/Day (KES)"),
+                  e("input",{className:"inp",type:"number",value:c.flatDayRate||"",style:{fontSize:12,padding:"5px 8px"},
+                    placeholder:"e.g. 80000",onChange:ev=>updConf(i,"flatDayRate",ev.target.value)})
+                ),
+            (c.pricingBasis||"per_delegate")==="per_delegate"&&e("div",null,
+              e("label",{style:{fontSize:10,color:"rgba(255,255,255,0.4)",display:"block",marginBottom:3,textTransform:"uppercase",letterSpacing:0.5}},"Delegates"),
+              e("input",{className:"inp",type:"number",min:0,value:c.numDelegates,style:{fontSize:12,padding:"5px 8px"},
+                placeholder:String(pax),onChange:ev=>updConf(i,"numDelegates",ev.target.value)}),
+              e("div",{style:{fontSize:10,color:"rgba(255,255,255,0.35)",marginTop:3}},"Defaults to trip PAX ("+pax+") if left blank")
+            ),
+            e("div",null,
+              e("label",{style:{fontSize:10,color:"rgba(255,255,255,0.4)",display:"block",marginBottom:3,textTransform:"uppercase",letterSpacing:0.5}},"Number of Days"),
+              e("input",{className:"inp",type:"number",min:1,value:c.numDays,style:{fontSize:12,padding:"5px 8px"},
+                onChange:ev=>updConf(i,"numDays",ev.target.value)})
+            )
+          ),
+          cpp>0&&e("div",{style:{fontSize:12,color:"#5cef80",marginBottom:12}},
+            fmt(total)," total ÷ "+pax+" trip pax = ",e("b",null,fmt(cpp)),"/pax"
+          ),
+          // Inclusions
+          e("div",{style:{marginTop:8,padding:"12px 14px",background:"rgba(245,197,0,0.05)",border:"1px solid rgba(245,197,0,0.15)",borderRadius:8}},
+            e("div",{style:{fontSize:12,fontWeight:"bold",color:"#f5c500",letterSpacing:1,textTransform:"uppercase",marginBottom:8}},"📦 Inclusions"),
+            e("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8}},
+              [["teaBreaks","Tea/Coffee Breaks"],["lunch","Lunch"],["projector","LCD Projector"],
+               ["screen","Screen"],["flipchart","Flipchart"],["wifi","WiFi"],
+               ["paSystem","PA System"],["stationery","Stationery"],["bottledWater","Bottled Water"]
+              ].map(([key,label])=>
+                e("label",{key,style:{display:"flex",alignItems:"center",gap:6,fontSize:12,color:"rgba(255,255,255,0.7)",cursor:"pointer"}},
+                  e("input",{type:"checkbox",checked:!!inc[key],onChange:ev=>updConfInclusion(i,key,ev.target.checked)}),
+                  label
+                )
+              )
+            )
+          ),
+          e("div",{style:{marginTop:12}},
+            e("label",{className:"field-label"},"Notes"),
+            e("textarea",{className:"inp",rows:2,value:c.notes,onChange:ev=>updConf(i,"notes",ev.target.value),placeholder:"e.g. Theatre-style seating, branded backdrop required"})
+          )
+        )
+      );
+    }),
+    form.conferenceFacilities.length>0&&e("div",{style:{marginTop:14,padding:"12px 16px",background:"rgba(92,239,128,0.08)",borderRadius:8,fontSize:13}},
+      "Total conference facilities per person: ",e("b",{style:{color:"#5cef80"}},fmt(totals.conferenceCPP))
+    )
   );
 }
 
@@ -2471,15 +2886,30 @@ function TabPricing({form,upd,totals,settings}){
             e("td",{style:{padding:"9px 8px",textAlign:"right"}},cpp?fmt(cpp):"—")
           );
         }),
-        ...form.transports.map((t,i)=>
-          e("tr",{key:t.id,style:{borderBottom:"1px solid rgba(255,255,255,0.06)"}},
-            e("td",{style:{padding:"9px 8px",color:"rgba(255,255,255,0.6)"}},"🚗 "+(t.label||"Transport "+(i+1))),
-            e("td",{style:{padding:"9px 8px",textAlign:"right"}},t.costPerPerson?fmt(Number(t.costPerPerson)):"—")
-          )
-        ),
+        ...form.transports.map((t,i)=>{
+          const tCpp=vehicleCostCPP(t,Number(form.pax)||1);
+          const basis=(t.pricingBasis||"per_vehicle")==="per_vehicle"
+            ?(Number(t.numVehicles)||1)+"× "+(t.vehicleType||"vehicle")+" ÷ "+(Number(form.pax)||1)+" pax"
+            :(t.pricingBasis==="per_trip"?"per trip ÷ "+(Number(form.pax)||1)+" pax":"per person");
+          return e("tr",{key:t.id,style:{borderBottom:"1px solid rgba(255,255,255,0.06)"}},
+            e("td",{style:{padding:"9px 8px",color:"rgba(255,255,255,0.6)"}},
+              "🚗 "+(t.label||"Transport "+(i+1)),
+              e("span",{style:{fontSize:11,opacity:0.5,marginLeft:6}},"("+basis+")")
+            ),
+            e("td",{style:{padding:"9px 8px",textAlign:"right"}},tCpp?fmt(tCpp):"—")
+          );
+        }),
         e("tr",{style:{borderBottom:"1px solid rgba(255,255,255,0.06)"}},
           e("td",{style:{padding:"9px 8px",color:"rgba(255,255,255,0.6)"}},"🎯 Excursions"),
           e("td",{style:{padding:"9px 8px",textAlign:"right"}},fmt(totals.excursionCPP))
+        ),
+        totals.conferenceCPP>0&&e("tr",{style:{borderBottom:"1px solid rgba(255,255,255,0.06)"}},
+          e("td",{style:{padding:"9px 8px",color:"rgba(255,255,255,0.6)"}},"🏢 Conference Facilities",
+            e("span",{style:{fontSize:11,color:"rgba(255,255,255,0.35)",marginLeft:6}},
+              form.conferenceFacilities.filter(c=>c.facilityName).map(c=>c.facilityName).join(" · ")||""
+            )
+          ),
+          e("td",{style:{padding:"9px 8px",textAlign:"right"}},fmt(totals.conferenceCPP))
         ),
         form.parkFees.some(p=>p.includedInPackage&&p.costPerPerson)&&
           e("tr",{style:{borderBottom:"1px solid rgba(255,255,255,0.06)"}},
@@ -2504,27 +2934,21 @@ function TabPricing({form,upd,totals,settings}){
           e("td",{style:{padding:"9px 8px",color:"rgba(255,255,255,0.6)"}},"⚙️ Service Fee ("+form.serviceMarginPercent+"%)"),
           e("td",{style:{padding:"9px 8px",textAlign:"right"}},fmt(totals.serviceFeeCPP))
         ),
-        e("tr",{style:{background:"rgba(245,197,0,0.1)",fontWeight:"bold"}},
-          e("td",{style:{padding:"12px 8px",color:"#f5c500",fontSize:15}},"Total per Adult"),
-          e("td",{style:{padding:"12px 8px",textAlign:"right",color:"#f5c500",fontSize:15}},fmt(totals.totalCPP))
-        ),
-        totals.hasChildren&&e("tr",{style:{borderBottom:"1px solid rgba(255,255,255,0.06)",background:"rgba(99,102,241,0.06)"}},
-          e("td",{style:{padding:"9px 8px",color:"#a5b4fc",fontSize:12}},
-            e("span",{style:{display:"block",fontWeight:"bold",marginBottom:2}},"👶 Child Price Adjustment Applied"),
-            e("span",{style:{color:"rgba(255,255,255,0.4)"}},
-              "Adults: ",Math.max(0,Number(form.pax)-Number(form.childrenTotal||0)),
-              Number(form.infants)>0?" · Infants: "+form.infants+" @ "+form.infantRatePct+"%":"",
-              Number(form.childrenAged)>0?" · Children: "+form.childrenAged+" @ "+form.childRatePct+"%":"",
-              Number(form.youngAdults)>0?" · Young Adults: "+form.youngAdults+" @ "+form.youngAdultRatePct+"%":"",
-              " · Park fees: infants "+form.childParkFeeInfantPct+"%, children "+form.childParkFeeChildPct+"%, young adults "+form.childParkFeeYoungAdultPct+"%"
-            )
-          ),
-          e("td",{style:{padding:"9px 8px",textAlign:"right",color:"#a5b4fc",fontSize:12}},
-            "Adj. PAX: ",totals.adjPax!==undefined?totals.adjPax.toFixed(2):"—"
-          )
-        ),
+        // ── Per-category PAX breakdown — every guest category is its own full price line ──
+        ...Object.entries(totals.categories).filter(([k,c])=>c.count>0).map(([k,c])=>{
+          const isAdult=k==="adult";
+          const label={adult:"🧑 Adult",infant:"🍼 Infant (0–2)",child:"👶 Child (3–11)",youngAdult:"🧒 Young Adult (12–17)"}[k];
+          const color=isAdult?"#f5c500":"#a5b4fc";
+          const bg=isAdult?"rgba(245,197,0,0.08)":"rgba(99,102,241,0.06)";
+          return e("tr",{key:k,style:{borderBottom:"1px solid rgba(255,255,255,0.06)",background:bg}},
+            e("td",{style:{padding:"9px 8px",color,fontSize:13,fontWeight:isAdult?"bold":"normal"}},
+              label+" × "+c.count),
+            e("td",{style:{padding:"9px 8px",textAlign:"right",color,fontSize:13,fontWeight:isAdult?"bold":"normal"}},
+              fmt(c.rate)+" ea = ",e("b",null,fmt(c.subtotal)))
+          );
+        }),
         e("tr",{style:{background:"rgba(92,239,128,0.08)",fontWeight:"bold"}},
-          e("td",{style:{padding:"12px 8px",color:"#5cef80",fontSize:16}},"Group Total ("+form.pax+" PAX, child-adjusted)"),
+          e("td",{style:{padding:"12px 8px",color:"#5cef80",fontSize:16}},"Group Total ("+form.pax+" PAX)"),
           e("td",{style:{padding:"12px 8px",textAlign:"right",color:"#5cef80",fontSize:16}},fmt(totals.totalGroup))
         )
       )
@@ -2678,14 +3102,14 @@ function QuoteDoc({form,totals,settings,onBack}){
             ])
           ),
           // Child policy row (only if children present)
-          Number(form.childrenTotal||0)>0&&e("div",{style:{marginTop:14,background:"#f9fdf5",border:"1px solid #d8edd0",borderRadius:8,overflow:"hidden"}},
+          (Number(form.infants||0)+Number(form.childrenAged||0)+Number(form.youngAdults||0))>0&&e("div",{style:{marginTop:14,background:"#f9fdf5",border:"1px solid #d8edd0",borderRadius:8,overflow:"hidden"}},
             e("div",{style:{background:"#0d4a1a",color:"#f5c500",fontSize:12,fontWeight:"bold",padding:"7px 14px",letterSpacing:1,textTransform:"uppercase"}},
               "👶 Child Policy"
             ),
             e("div",{style:{padding:"14px 16px"}},
               e("div",{style:{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginBottom:Number(form.childAges||form.childrenSharing)?12:0}},
                 ...[
-                  ["Total Children",form.childrenTotal],
+                  ["Total Children",(Number(form.infants||0)+Number(form.childrenAged||0)+Number(form.youngAdults||0))],
                   ["Infants (0–3 yrs)",form.infants||0],
                   ["Children (3–11 yrs)",form.childrenAged||0],
                   ["Young Adults (12–17 yrs)",form.youngAdults||0],
@@ -2698,7 +3122,12 @@ function QuoteDoc({form,totals,settings,onBack}){
               ),
               (form.childAges||form.childrenSharing)&&e("div",{style:{display:"flex",gap:16,flexWrap:"wrap",fontSize:13,color:"#444",marginTop:4}},
                 form.childAges&&e("span",null,e("b",{style:{color:"#0d4a1a"}},"Ages: "),form.childAges),
-                form.childrenSharing&&e("span",null,e("b",{style:{color:"#0d4a1a"}},"Sharing: "),form.childrenSharing)
+                form.childrenSharing&&e("span",null,e("b",{style:{color:"#0d4a1a"}},"Sharing: "),
+                  form.childrenSharing.split(",").filter(Boolean).map(k=>({
+                    with_parents:"With parents/adults",own_room:"Own room/tent",share_each_other:"Sharing with each other",
+                    infant_cot:"Infants in cot",single_occupancy:"Single occupancy",tbc:"To be confirmed"
+                  }[k]||k)).join(", ")
+                )
               )
             )
           )
@@ -2842,6 +3271,36 @@ function QuoteDoc({form,totals,settings,onBack}){
             form.excursions.filter(x=>x.name).map((x,i)=>e("li",{key:x.id},x.name))
           )
         ),
+        // Conference / Meeting Facilities
+        form.conferenceFacilities.length>0&&e("div",{className:"doc-section"},
+          e("div",{className:"doc-section-title"},"Conference & Meeting Facilities"),
+          e("table",{className:"doc-table"},
+            e("thead",null,e("tr",null,
+              e("th",null,"Facility"),e("th",null,"Package"),e("th",null,"Delegates"),e("th",null,"Days"),e("th",{style:{textAlign:"right"}},"Total")
+            )),
+            e("tbody",null,
+              form.conferenceFacilities.map((c,i)=>{
+                const delegates=Number(c.numDelegates)||Number(form.pax)||0;
+                const days=Number(c.numDays)||1;
+                const total=conferenceFacilityCPP(c,Number(form.pax)||1)*Number(form.pax||1);
+                const incList=Object.entries({teaBreaks:"Tea/Coffee",lunch:"Lunch",projector:"Projector",screen:"Screen",flipchart:"Flipchart",wifi:"WiFi",paSystem:"PA System",stationery:"Stationery",bottledWater:"Water"})
+                  .filter(([k])=>(c.inclusions||{})[k]).map(([,l])=>l).join(", ");
+                return e("tr",{key:c.id},
+                  e("td",null,
+                    e("b",null,c.facilityName||"Conference Facility "+(i+1)),
+                    c.venue&&e("span",{style:{color:"#666",fontSize:12}}," — "+c.venue),
+                    c.date&&e("div",{style:{fontSize:11,color:"#888",marginTop:2}},c.date),
+                    incList&&e("div",{style:{fontSize:11,color:"#555",marginTop:2}},"Incl: "+incList)
+                  ),
+                  e("td",null,c.packageType),
+                  e("td",null,delegates),
+                  e("td",null,days+"d"),
+                  e("td",{style:{textAlign:"right"}},fmt(total))
+                );
+              })
+            )
+          )
+        ),
         // Park fees — client-friendly note only
         form.parkFees.length>0&&e("div",{className:"doc-section"},
           e("div",{className:"doc-section-title"},"Park & Conservancy Fees"),
@@ -2880,7 +3339,7 @@ function QuoteDoc({form,totals,settings,onBack}){
           e("div",{className:"doc-section-title"},"Investment Summary"),
           e("table",{className:"doc-table"},
             e("thead",null,e("tr",null,
-              e("th",null,"Package"),e("th",{style:{textAlign:"right"}},"Per Person"),e("th",{style:{textAlign:"right"}},"Total ("+form.pax+" PAX)")
+              e("th",null,"Package"),e("th",{style:{textAlign:"right"}},"Per Adult"),e("th",{style:{textAlign:"right"}},"Total ("+form.pax+" PAX)")
             )),
             e("tbody",null,
               totals.discountCPP>0&&e("tr",{style:{background:"#fff8e1"}},
@@ -2888,7 +3347,7 @@ function QuoteDoc({form,totals,settings,onBack}){
                   "Accommodation (before discounts)"
                 ),
                 e("td",{style:{textAlign:"right",color:"#7f6000",fontSize:13}},fmt(totals.accomCPP)),
-                e("td",{style:{textAlign:"right",color:"#7f6000",fontSize:13}},fmt(totals.accomCPP*form.pax))
+                e("td",{style:{textAlign:"right",color:"#7f6000",fontSize:13}},"—")
               ),
               totals.discountCPP>0&&e("tr",{style:{background:"#fff8e1"}},
                 e("td",{style:{color:"#1a6b2a",fontWeight:"bold",fontSize:13}},
@@ -2898,7 +3357,7 @@ function QuoteDoc({form,totals,settings,onBack}){
                     .join(" · ")
                 ),
                 e("td",{style:{textAlign:"right",color:"#1a6b2a",fontWeight:"bold",fontSize:13}},"−"+fmt(totals.discountCPP)),
-                e("td",{style:{textAlign:"right",color:"#1a6b2a",fontWeight:"bold",fontSize:13}},"−"+fmt(totals.discountCPP*form.pax))
+                e("td",{style:{textAlign:"right",color:"#1a6b2a",fontWeight:"bold",fontSize:13}},"—")
               ),
               e("tr",{className:"pricing-total-row"},
                 e("td",{style:{fontWeight:"bold",color:"#0d4a1a",fontSize:15}},
@@ -2911,6 +3370,29 @@ function QuoteDoc({form,totals,settings,onBack}){
                 e("td",{colSpan:3,style:{color:"#666",fontSize:12,fontStyle:"italic",paddingTop:8}},
                   "* Park entry fees marked as 'Payable by Client' are not included in the above total."
                 )
+              )
+            )
+          ),
+          // Per-category guest pricing — shown whenever there's more than one rate category,
+          // so the Total above is never a mystery to the client.
+          totals.hasChildren&&e("table",{className:"doc-table",style:{marginTop:10}},
+            e("thead",null,e("tr",null,
+              e("th",null,"Guest Category"),e("th",{style:{textAlign:"center"}},"Count"),
+              e("th",{style:{textAlign:"right"}},"Rate Each"),e("th",{style:{textAlign:"right"}},"Subtotal")
+            )),
+            e("tbody",null,
+              Object.entries(totals.categories).filter(([k,c])=>c.count>0).map(([k,c])=>{
+                const label={adult:"Adult",infant:"Infant (0–2)",child:"Child (3–11)",youngAdult:"Young Adult (12–17)"}[k];
+                return e("tr",{key:k},
+                  e("td",{style:{fontSize:13,color:"#333"}},label),
+                  e("td",{style:{textAlign:"center",fontSize:13,color:"#333"}},c.count),
+                  e("td",{style:{textAlign:"right",fontSize:13,color:"#333"}},fmt(c.rate)),
+                  e("td",{style:{textAlign:"right",fontSize:13,color:"#333"}},fmt(c.subtotal))
+                );
+              }),
+              e("tr",{className:"pricing-total-row"},
+                e("td",{colSpan:3,style:{fontWeight:"bold",color:"#0d4a1a",fontSize:14}},"Group Total"),
+                e("td",{style:{textAlign:"right",fontWeight:"bold",color:"#1a6b2a",fontSize:14}},fmt(totals.totalGroup))
               )
             )
           )
